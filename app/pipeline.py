@@ -12,9 +12,11 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -24,6 +26,8 @@ from . import db
 from .config import settings
 from .dicom import DicomValidationError, ParsedFile, parse_and_validate, remap_to_bytes
 from .ids import ID_KINDS
+
+logger = logging.getLogger("dicom_remap.pipeline")
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -102,8 +106,17 @@ def recover_on_startup() -> list[str]:
     return stale
 
 
-def process_batch(project_id: str, files: list[UploadedFile]) -> str:
-    """同步处理一个批次，返回 batch_id。任何异常都保证不留部分批次。"""
+def process_batch(
+    project_id: str,
+    files: list[UploadedFile],
+    slow_conversion_seconds: float = 0.0,
+) -> str:
+    """同步处理一个批次，返回 batch_id。任何异常都保证不留部分批次。
+
+    ``slow_conversion_seconds`` 为演示用“可控慢转换”：在映射保留事务提交
+    （写锁已释放）之后、真正转换之前注入延时，用于稳定复现并发等待与
+    断连场景。延时期间不持有任何数据库事务/写锁。
+    """
     validate_upload_bundle(files)
     batch_id = str(uuid.uuid4())
     work_dir = _staging_dir(batch_id)
@@ -134,13 +147,26 @@ def process_batch(project_id: str, files: list[UploadedFile]) -> str:
     }
 
     # ---- 阶段 2：短写锁内保留映射（含对并发批次的等待），返回后立即放锁 ------ #
+    # 关键修复：保留阶段也可能登记过 PENDING 批次/映射（等待超时即发生在此处），
+    # 因此任何异常都必须走 fail_batch 回收，绝不允许 PENDING 遗留阻塞后续上传。
     conn = db.connect()
     try:
-        mapping = db.reserve_mappings(conn, project_id, batch_id, requested)
+        try:
+            mapping = db.reserve_mappings(conn, project_id, batch_id, requested)
+        except Exception as exc:
+            conn.close()
+            _abort(batch_id, f"映射保留失败（已回滚）: {exc}")
+            raise
     except Exception:
-        conn.close()
+        # _abort 已清理暂存；防御性再清理一次（_abort 自身失败时仍不残留）
         cleanup_staging(batch_id)
         raise
+
+    # ---- 阶段 2.5：可控慢转换（演示钩子，不持任何写锁/事务） ---------------- #
+    if slow_conversion_seconds > 0:
+        delay = min(slow_conversion_seconds, settings.max_slow_seconds)
+        logger.info("批次 %s 注入慢转换延时 %.2fs（不持有写锁）", batch_id, delay)
+        time.sleep(delay)
 
     # ---- 阶段 3：转换，不持有任何数据库事务/写锁 ----------------------------- #
     file_records: list[dict] = []
@@ -185,15 +211,25 @@ def process_batch(project_id: str, files: list[UploadedFile]) -> str:
         conn.close()
 
     cleanup_staging(batch_id)
+    logger.info("批次 %s 已发布（%d 个文件，%d 字节）", batch_id, len(file_records), total_out)
     return batch_id
 
 
 def _abort(batch_id: str, error: str) -> None:
-    conn = db.connect()
+    """失败回滚（自管连接）：标记 FAILED、删除本批独占未发布映射、清暂存。
+
+    保证不抛出（回滚本身失败只记录日志），避免掩盖触发回滚的原始异常。
+    """
     try:
-        _abort_with_conn(conn, batch_id, error)
+        conn = db.connect()
+        try:
+            _abort_with_conn(conn, batch_id, error)
+        finally:
+            conn.close()
+    except Exception:  # pragma: no cover - 回滚失败兜底，启动恢复仍会回收
+        logger.exception("批次 %s 即时回滚失败，将依赖启动恢复兜底", batch_id)
     finally:
-        conn.close()
+        cleanup_staging(batch_id)
 
 
 def _abort_with_conn(conn, batch_id: str, error: str) -> None:

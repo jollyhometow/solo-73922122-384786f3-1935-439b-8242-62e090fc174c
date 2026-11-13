@@ -1,16 +1,16 @@
 """FastAPI 入口：项目选择、DICOM 批次上传、批次列表与整批 ZIP 下载。"""
 from __future__ import annotations
 
+import logging
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db
+from . import db, jobs
 from .config import settings
 from .dicom import DicomValidationError
 from .ids import ID_KINDS
@@ -21,6 +21,8 @@ from .pipeline import (
     recover_on_startup,
     zip_path,
 )
+
+logger = logging.getLogger("dicom_remap.api")
 
 WEB_DIR = Path(__file__).parent / "web"
 
@@ -35,11 +37,13 @@ async def lifespan(app: FastAPI):
         db.init_db()
         recover_on_startup()
     yield
+    # 优雅关闭：等待在途批次完成发布或回滚，再释放执行名额/连接
+    await jobs.shutdown_jobs()
 
 
 app = FastAPI(
     title="科研影像 DICOM 统一标识入库服务",
-    version="1.0.0",
+    version="1.1.0",
     description="按研究项目隔离的 DICOM UID/PatientID 持久重映射与整批 ZIP 下载",
     lifespan=lifespan,
 )
@@ -54,7 +58,8 @@ def _get_project_or_404(conn, project_id: str):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    # 纯内存读取，不触碰批次执行器：任何数量的上传等待都不会拖慢本接口
+    return {"status": "ok", "inflight_jobs": jobs.inflight_count()}
 
 
 @app.get("/api/projects")
@@ -82,6 +87,7 @@ def post_project(name: str = Form(...)):
 @app.post("/api/batches")
 async def create_batch(
     project_id: str = Form(...),
+    slow_conversion_seconds: float = Form(0.0),
     files: list[UploadFile] = File(..., description="最多 20 份、合计 ≤16 MiB 的未压缩 DICOM"),
 ):
     conn = db.connect()
@@ -112,10 +118,17 @@ async def create_batch(
             detail=f"单批最多 {settings.max_files} 份文件，本次为 {len(payload)} 份",
         )
 
+    # 演示用慢转换：钳制到允许上限，负数归零
+    delay = max(0.0, min(slow_conversion_seconds, settings.max_slow_seconds))
+
     try:
-        # 转换为 CPU/文件密集型同步流水线，放到线程池执行，避免阻塞事件循环，
-        # 保证多批次 HTTP 请求能真正并发进入保留协议。
-        batch_id = await run_in_threadpool(process_batch, project_id, payload)
+        # 关键：提交到“批次专用执行器”而不是 anyio 共享线程池。
+        # 即使本请求等待他批次发布长达 DICOM_REMAP_LOCK_WAIT 秒，也只占用
+        # 专用执行器名额；health/批次/映射查询走共享池，始终能在 1 秒内返回。
+        # 客户端断连只会取消这里的 await，执行器内的作业会继续完成发布/回滚。
+        batch_id = await jobs.run_batch_job(
+            process_batch, project_id, payload, delay
+        )
     except UploadLimitError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     except DicomValidationError as exc:
@@ -201,6 +214,10 @@ def get_meta():
         "max_total_bytes": settings.max_total_bytes,
         "max_total_mib": settings.max_total_bytes / (1024 * 1024),
         "id_kinds": ID_KINDS,
+        "workers": settings.workers,
+        "lock_wait_seconds": settings.lock_wait_seconds,
+        "max_slow_seconds": settings.max_slow_seconds,
+        "inflight_jobs": jobs.inflight_count(),
     }
 
 

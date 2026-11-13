@@ -139,6 +139,9 @@ def project_id(client):
     return resp.json()[0]["id"]
 
 
-def upload(client, project_id, paths):
+def upload(client, project_id, paths, slow_seconds: float = 0.0):
     files = [("files", (p.name, p.read_bytes(), "application/dicom")) for p in paths]
-    return client.post("/api/batches", data={"project_id": project_id}, files=files)
+    data = {"project_id": project_id}
+    if slow_seconds:
+        data["slow_conversion_seconds"] = str(slow_seconds)
+    return client.post("/api/batches", data=data, files=files)

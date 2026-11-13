@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import sys
 import tempfile
 import threading
@@ -29,11 +30,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# 隔离模式（python -I）会忽略 PYTHONPATH；本地验收时通过 PY_LIBS 指向依赖目录，
+# 容器内依赖安装在标准 site-packages，无需设置该变量。
+_py_libs = os.environ.get("PY_LIBS")
+if _py_libs:
+    import site
+
+    site.addsitedir(_py_libs)
+
 import httpx  # noqa: E402
 import pydicom  # noqa: E402
 import uvicorn  # noqa: E402
 
-from app.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
 
 SAMPLE_SOURCE_UIDS = {
@@ -90,11 +98,11 @@ def main() -> int:
         return 2
 
     tmp = Path(tempfile.mkdtemp(prefix="dicom-demo-"))
-    import os
     os.environ["DICOM_REMAP_DATA"] = str(tmp)
-    # 各模块持有的是同一个 settings 引用；frozen dataclass 用 object.__setattr__
-    # 绕过冻结，db_path/staging_dir/published_dir 均为 property，会立即反映新目录。
-    object.__setattr__(settings, "data_dir", tmp)
+    # 各模块持有的是同一个 settings 引用；reload_settings 原地重建该对象，
+    # db_path/staging_dir/published_dir 均为 property，会立即指向新目录。
+    from app.config import reload_settings
+    reload_settings()
 
     port = 18080
     ServerThread(port).start()

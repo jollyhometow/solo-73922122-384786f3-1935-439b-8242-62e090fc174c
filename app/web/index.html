@@ -100,6 +100,10 @@
 
     <div class="row" style="margin-top:14px;">
       <button id="uploadBtn" disabled type="button">上传并入库整批</button>
+      <div style="flex:0 0 auto; min-width:170px;">
+        <label for="slowSeconds" style="margin-bottom:4px;">慢转换延时（秒，演示用，0=关闭）</label>
+        <input type="text" id="slowSeconds" value="0" inputmode="decimal" />
+      </div>
       <span class="hint" id="sizeHint"></span>
     </div>
     <div class="msg" id="uploadMsg"></div>
@@ -126,6 +130,7 @@
       </div>
       <div class="hint" style="margin-top:10px;">
         <button class="secondary" id="refreshBtn" type="button">刷新列表</button>
+        <span id="inflightHint" style="margin-left:10px;"></span>
       </div>
     </section>
 
@@ -214,6 +219,8 @@ $("uploadBtn").addEventListener("click", async () => {
   }
   const fd = new FormData();
   fd.append("project_id", $("project").value);
+  const slow = parseFloat($("slowSeconds").value) || 0;
+  if (slow > 0) fd.append("slow_conversion_seconds", String(slow));
   pickedFiles.forEach(f => fd.append("files", f, f.name));
   $("uploadBtn").disabled = true;
   try {
@@ -290,10 +297,27 @@ $("refreshBtn").addEventListener("click", () => {
 });
 $("project").addEventListener("change", () => { loadBatches(); loadMappings(); });
 
+// 在途作业指示 + PENDING 时自动刷新（慢转换/等待期间可观察状态推进，无需手动刷新）
+let lastPending = false;
+async function pollInflight() {
+  try {
+    const health = await api("/api/health");
+    const n = health.inflight_jobs || 0;
+    $("inflightHint").textContent = n > 0 ? `在途批次作业：${n}` : "所有批次作业已结束";
+    if (n > 0 || lastPending) {
+      lastPending = n > 0;
+      await loadBatches();
+      if ($("mappingsView").style.display !== "none") await loadMappings();
+    }
+  } catch (_) { /* 轮询失败静默，下一拍重试 */ }
+}
+setInterval(pollInflight, 1500);
+
 (async function init() {
   await loadMeta();
   await loadProjects("project");
   await loadBatches();
+  pollInflight();
 })();
 </script>
 </body>

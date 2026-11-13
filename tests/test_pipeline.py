@@ -19,7 +19,9 @@ SOP_CLASS_CT = "1.2.840.10008.5.1.4.1.1.2"
 
 
 def test_health_and_projects(client):
-    assert client.get("/api/health").json() == {"status": "ok"}
+    health = client.get("/api/health").json()
+    assert health["status"] == "ok"
+    assert health["inflight_jobs"] == 0
     projects = client.get("/api/projects").json()
     assert len(projects) >= 2
 
@@ -259,9 +261,12 @@ def test_arbitrary_nested_sequence_reference_remapped(client, project_id, sample
     ds.OriginalAttributesSequence = Sequence([outer])
     ds.save_as(str(f), enforce_file_format=True)
 
-    assert upload(client, project_id, [f]).status_code == 201
-    batch = client.get("/api/batches", params={"project_id": project_id}).json()[0]
-    dl = client.get(f"/api/batches/{batch['id']}/download")
+    # 必须使用上传响应里的批次 ID：created_at 精度为秒，同秒批次的列表排序
+    # 不保证本批次位于第一行
+    resp = upload(client, project_id, [f])
+    assert resp.status_code == 201
+    batch_id = resp.json()["id"]
+    dl = client.get(f"/api/batches/{batch_id}/download")
     with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
         out = pydicom.dcmread(io.BytesIO(zf.read("nested.dcm")))
     mappings = {(m["id_kind"], m["source_value"]): m["target_value"]

@@ -9,7 +9,14 @@ services:
       # 单批限额：20 份 / 16 MiB
       DICOM_REMAP_MAX_FILES: "20"
       DICOM_REMAP_MAX_TOTAL_BYTES: "16777216"
+      # 同源映射等待窗口（秒）：并发修复不缩短该值，保持 60
       DICOM_REMAP_LOCK_WAIT: "60"
+      # 批次流水线专用执行器线程数（与 anyio 共享线程池隔离，不随等待放大）
+      DICOM_REMAP_WORKERS: "8"
+      # 演示用“可控慢转换”允许注入的最大延时（秒）
+      DICOM_REMAP_MAX_SLOW_SECONDS: "10"
+      # 优雅退出时等待在途批次完成发布/回滚的最长时间（秒）
+      DICOM_REMAP_SHUTDOWN_WAIT: "70"
       GENERATE_SAMPLES: "true"
     volumes:
       - dicom-data:/data

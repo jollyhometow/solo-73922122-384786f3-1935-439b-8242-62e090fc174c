@@ -14,8 +14,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# 隔离模式（python -I）会忽略 PYTHONPATH；本地验收时通过 PY_LIBS 指向依赖目录，
+# 容器内依赖安装在标准 site-packages，无需设置该变量。
+_py_libs = os.environ.get("PY_LIBS")
+if _py_libs:
+    import site
+
+    site.addsitedir(_py_libs)
 
 from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.uid import (
